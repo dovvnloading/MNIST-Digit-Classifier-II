@@ -1,0 +1,773 @@
+import sys
+import numpy as np
+import cv2
+from PyQt5.QtWidgets import (QApplication, QFileDialog, QGridLayout, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+                             QPushButton, QLabel, QStackedWidget, QProgressBar, QFrame, QSizePolicy,
+                             QLineEdit, QFormLayout, QSpinBox, QDoubleSpinBox, QComboBox, QMessageBox,
+                             QCheckBox, QGroupBox)
+from PyQt5.QtGui import QDoubleValidator, QIntValidator, QPainter, QColor, QPen, QPixmap, QFont, QImage
+from PyQt5.QtCore import Qt, QRect, QPoint, QSize, QThread, pyqtSignal
+import tensorflow as tf
+from tensorflow.keras.datasets import mnist
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.models import Sequential, load_model
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout, BatchNormalization
+from tensorflow.keras.callbacks import Callback, LearningRateScheduler, EarlyStopping
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+import os
+
+
+
+
+
+def load_and_preprocess_data():
+    (x_train, y_train), (x_test, y_test) = mnist.load_data()
+    x_train = x_train.astype('float32') / 255
+    x_test = x_test.astype('float32') / 255
+    x_train = x_train.reshape((x_train.shape[0], 28, 28, 1))
+    x_test = x_test.reshape((x_test.shape[0], 28, 28, 1))
+    y_train = to_categorical(y_train, 10)
+    y_test = to_categorical(y_test, 10)
+    return (x_train, y_train), (x_test, y_test)
+
+class StyleSheet:
+    MAIN = """
+    QMainWindow, QWidget {
+        background-color: #1E1E1E;
+        color: #FFFFFF;
+    }
+    QLabel {
+        font-size: 16px;
+    }
+    QPushButton {
+        background-color: #3A3A3A;
+        color: #FFFFFF;
+        border: none;
+        padding: 10px 20px;
+        margin: 5px;
+        border-radius: 5px;
+        font-size: 16px;
+        min-width: 120px;
+    }
+    QPushButton:hover {
+        background-color: #4A4A4A;
+    }
+    QPushButton:pressed {
+        background-color: #2A2A2A;
+    }
+    QProgressBar {
+        border: 2px solid #3A3A3A;
+        border-radius: 5px;
+        text-align: center;
+        height: 25px;
+    }
+    QProgressBar::chunk {
+        background-color: #3A7CA5;
+    }
+    QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
+        background-color: #2A2A2A;
+        color: #FFFFFF;
+        border: 1px solid #3A3A3A;
+        border-radius: 5px;
+        padding: 5px;
+        font-size: 14px;
+    }
+    QFormLayout {
+        margin: 10px;
+    }
+    QCheckBox {
+        color: #FFFFFF;
+        font-size: 14px;
+    }
+    QGroupBox {
+        border: 1px solid #3A3A3A;
+        border-radius: 5px;
+        margin-top: 10px;
+        font-size: 16px;
+        padding-top: 10px;
+    }
+    QGroupBox::title {
+        subcontrol-origin: margin;
+        left: 10px;
+        padding: 0 3px 0 3px;
+    }
+    """
+
+
+
+class TrainingThread(QThread):
+    update_progress = pyqtSignal(int, dict)
+    training_finished = pyqtSignal(object, float, float)
+
+    def __init__(self, model, x_train, y_train, x_test, y_test, epochs, batch_size, use_data_augmentation=False,
+                 use_lr_schedule=False, use_early_stopping=False):
+        super().__init__()
+        self.model = model
+        self.x_train = x_train
+        self.y_train = y_train
+        self.x_test = x_test
+        self.y_test = y_test
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.use_data_augmentation = use_data_augmentation
+        self.use_lr_schedule = use_lr_schedule
+        self.use_early_stopping = use_early_stopping
+
+    def run(self):
+        class ThreadCallback(Callback):
+            def __init__(self, thread):
+                super().__init__()
+                self.thread = thread
+
+            def on_epoch_end(self, epoch, logs=None):
+                progress = int((epoch + 1) / self.thread.epochs * 100)
+                self.thread.update_progress.emit(progress, logs)
+
+        class EpochLimitCallback(Callback):
+            def __init__(self, epochs):
+                super().__init__()
+                self.epochs = epochs
+
+            def on_epoch_end(self, epoch, logs=None):
+                if epoch + 1 >= self.epochs:
+                    self.model.stop_training = True
+
+        callbacks = [ThreadCallback(self), EpochLimitCallback(self.epochs)]
+
+        if self.use_lr_schedule:
+            def lr_schedule(epoch):
+                lr = 0.001
+                if epoch > 75:
+                    lr *= 0.1
+                elif epoch > 100:
+                    lr *= 0.01
+                return lr
+            callbacks.append(LearningRateScheduler(lr_schedule))
+
+        if self.use_early_stopping:
+            callbacks.append(EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True))
+
+        if self.use_data_augmentation:
+            datagen = ImageDataGenerator(
+                rotation_range=10,
+                zoom_range=0.1,
+                width_shift_range=0.1,
+                height_shift_range=0.1,
+                validation_split=0.2
+            )
+            train_generator = datagen.flow(self.x_train, self.y_train, batch_size=self.batch_size, subset='training')
+            val_generator = datagen.flow(self.x_train, self.y_train, batch_size=self.batch_size, subset='validation')
+            
+            steps_per_epoch = int(len(self.x_train) * 0.8 // self.batch_size)
+            validation_steps = int(len(self.x_train) * 0.2 // self.batch_size)
+        
+            history = self.model.fit(
+                train_generator,
+                steps_per_epoch=steps_per_epoch,
+                epochs=self.epochs,
+                validation_data=val_generator,
+                validation_steps=validation_steps,
+                callbacks=callbacks
+            )
+        else:
+            history = self.model.fit(
+                self.x_train, self.y_train,
+                epochs=self.epochs,
+                batch_size=self.batch_size,
+                validation_split=0.2,
+                callbacks=callbacks
+            )
+
+        test_loss, test_acc = self.model.evaluate(self.x_test, self.y_test, verbose=0)
+        self.training_finished.emit(self.model, test_loss, test_acc)
+        
+class MNISTClassifier(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("MNIST Classifier")
+        self.setGeometry(100, 100, 1200, 800)
+        self.setStyleSheet(StyleSheet.MAIN)
+        
+        self.central_widget = QWidget()
+        self.setCentralWidget(self.central_widget)
+        self.layout = QVBoxLayout(self.central_widget)
+        self.layout.setContentsMargins(20, 20, 20, 20)
+        
+        self.stacked_widget = QStackedWidget()
+        self.layout.addWidget(self.stacked_widget)
+        
+        self.main_menu = self.create_main_menu()
+        self.training_page = self.create_training_page()
+        self.drawing_page = self.create_drawing_page()
+        
+        self.stacked_widget.addWidget(self.main_menu)
+        self.stacked_widget.addWidget(self.training_page)
+        self.stacked_widget.addWidget(self.drawing_page)
+        
+        self.model = None
+        self.training_thread = None
+        self.epochs = 0  # Store the number of epochs
+        
+    def load_and_preprocess_data(self):
+        (x_train, y_train), (x_test, y_test) = mnist.load_data()
+        x_train = x_train.astype('float32') / 255
+        x_test = x_test.astype('float32') / 255
+        x_train = x_train.reshape((x_train.shape[0], 28, 28, 1))
+        x_test = x_test.reshape((x_test.shape[0], 28, 28, 1))
+        y_train = to_categorical(y_train, 10)
+        y_test = to_categorical(y_test, 10)
+        return (x_train, y_train), (x_test, y_test)
+
+    def create_main_menu(self):
+        menu_widget = QWidget()
+        menu_layout = QVBoxLayout(menu_widget)
+        menu_layout.setAlignment(Qt.AlignCenter)
+        menu_layout.setSpacing(20)
+        
+        title = QLabel("MNIST Classifier")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet("font-size: 48px; font-weight: bold; margin-bottom: 40px;")
+        menu_layout.addWidget(title)
+        
+        button_container = QWidget()
+        button_layout = QVBoxLayout(button_container)
+        button_layout.setAlignment(Qt.AlignCenter)
+        button_layout.setSpacing(20)
+        
+        train_button = QPushButton("Train Model")
+        train_button.clicked.connect(self.start_training)
+        train_button.setFixedSize(250, 60)
+        train_button.setToolTip("Train a new model or retrain an existing one")
+        button_layout.addWidget(train_button)
+        
+        test_button = QPushButton("Test Model")
+        test_button.clicked.connect(self.start_testing)
+        test_button.setFixedSize(250, 60)
+        test_button.setToolTip("Test the trained model by drawing digits")
+        button_layout.addWidget(test_button)
+        
+        menu_layout.addWidget(button_container)
+        
+        return menu_widget
+
+    def create_training_page(self):
+        training_widget = QWidget()
+        main_layout = QHBoxLayout(training_widget)
+        main_layout.setContentsMargins(20, 20, 20, 20)
+        main_layout.setSpacing(20)
+
+        # Left side - Settings and Controls
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(20)
+
+        # Title
+        title = QLabel("Model Training")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet("font-size: 24px; font-weight: bold; margin-bottom: 10px;")
+        left_layout.addWidget(title)
+
+        # Basic Settings
+        basic_settings_group = QGroupBox("Basic Settings")
+        basic_settings_layout = QFormLayout()
+        basic_settings_group.setLayout(basic_settings_layout)
+
+        self.epochs_input = QLineEdit("50")
+        self.epochs_input.setValidator(QIntValidator(1, 1000))
+        self.epochs_input.setToolTip("Number of training epochs (1-1000)")
+        basic_settings_layout.addRow("Epochs:", self.epochs_input)
+
+        self.batch_size_input = QLineEdit("64")
+        self.batch_size_input.setValidator(QIntValidator(1, 1024))
+        self.batch_size_input.setToolTip("Batch size for training (1-1024)")
+        basic_settings_layout.addRow("Batch Size:", self.batch_size_input)
+
+        self.learning_rate_input = QLineEdit("0.001")
+        self.learning_rate_input.setValidator(QDoubleValidator(0.0001, 1.0, 4))
+        self.learning_rate_input.setToolTip("Learning rate for the optimizer (0.0001-1.0)")
+        basic_settings_layout.addRow("Learning Rate:", self.learning_rate_input)
+
+        self.optimizer_input = QComboBox()
+        self.optimizer_input.addItems(['adam', 'sgd', 'rmsprop'])
+        self.optimizer_input.setToolTip("Choose the optimization algorithm")
+        basic_settings_layout.addRow("Optimizer:", self.optimizer_input)
+
+        left_layout.addWidget(basic_settings_group)
+
+        # Advanced Settings
+        advanced_settings_group = QGroupBox("Advanced Settings")
+        advanced_settings_layout = QVBoxLayout()
+        advanced_settings_group.setLayout(advanced_settings_layout)
+
+        self.data_augmentation_checkbox = QCheckBox("Use Data Augmentation")
+        self.data_augmentation_checkbox.setToolTip("Enable data augmentation during training")
+        advanced_settings_layout.addWidget(self.data_augmentation_checkbox)
+
+        self.lr_schedule_checkbox = QCheckBox("Use Learning Rate Schedule")
+        self.lr_schedule_checkbox.setToolTip("Enable learning rate scheduling during training")
+        advanced_settings_layout.addWidget(self.lr_schedule_checkbox)
+
+        self.early_stopping_checkbox = QCheckBox("Use Early Stopping")
+        self.early_stopping_checkbox.setToolTip("Enable early stopping to prevent overfitting")
+        advanced_settings_layout.addWidget(self.early_stopping_checkbox)
+
+        left_layout.addWidget(advanced_settings_group)
+
+        # Buttons
+        button_layout = QHBoxLayout()
+
+        start_training_button = QPushButton("Start Training")
+        start_training_button.clicked.connect(self.train_model)
+        start_training_button.setStyleSheet("""
+            QPushButton {
+                background-color: #3A7CA5;
+                color: white;
+                border-radius: 5px;
+                font-size: 16px;
+                font-weight: bold;
+                padding: 10px 20px;
+            }
+            QPushButton:hover {
+                background-color: #2C5F7F;
+            }
+        """)
+        start_training_button.setToolTip("Begin training the model with the current settings")
+        button_layout.addWidget(start_training_button)        
+
+        back_button = QPushButton("Back to Main Menu")
+        back_button.clicked.connect(lambda: self.stacked_widget.setCurrentIndex(0))
+        back_button.setStyleSheet("""
+            QPushButton {
+                background-color: #4A4A4A;
+                color: white;
+                border-radius: 5px;
+                font-size: 16px;
+                padding: 10px 20px;
+            }
+            QPushButton:hover {
+                background-color: #5A5A5A;
+            }
+        """)
+        back_button.setToolTip("Return to the main menu")
+        button_layout.addWidget(back_button)
+
+        left_layout.addLayout(button_layout)
+
+        # Add left panel to main layout
+        main_layout.addWidget(left_panel, 1)
+
+        # Right side - Training Progress and Metrics
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(20)
+
+        # Progress Bar
+        progress_frame = QFrame()
+        progress_frame.setFrameShape(QFrame.StyledPanel)
+        progress_frame.setStyleSheet("""
+            QFrame {
+                background-color: #2A2A2A;
+                border-radius: 10px;
+                padding: 20px;
+            }
+        """)
+        progress_layout = QVBoxLayout(progress_frame)
+
+        progress_label = QLabel("Training Progress")
+        progress_label.setAlignment(Qt.AlignCenter)
+        progress_label.setStyleSheet("font-size: 18px; font-weight: bold; margin-bottom: 10px;")
+        progress_layout.addWidget(progress_label)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 2px solid #3A3A3A;
+                border-radius: 5px;
+                text-align: center;
+                height: 25px;
+            }
+            QProgressBar::chunk {
+                background-color: #3A7CA5;
+            }
+        """)
+        self.progress_bar.setToolTip("Training progress")
+        progress_layout.addWidget(self.progress_bar)
+
+        self.training_status = QLabel("Ready to train")
+        self.training_status.setAlignment(Qt.AlignCenter)
+        self.training_status.setStyleSheet("font-size: 14px; margin-top: 10px;")
+        progress_layout.addWidget(self.training_status)
+
+        right_layout.addWidget(progress_frame)
+
+        # Metrics
+        metrics_frame = QFrame()
+        metrics_frame.setFrameShape(QFrame.StyledPanel)
+        metrics_frame.setStyleSheet("""
+            QFrame {
+                background-color: #2A2A2A;
+                border-radius: 10px;
+                padding: 20px;
+            }
+            QLabel {
+                font-size: 14px;
+                color: white;
+            }
+        """)
+        metrics_layout = QVBoxLayout(metrics_frame)
+
+        metrics_label = QLabel("Training Metrics")
+        metrics_label.setAlignment(Qt.AlignCenter)
+        metrics_label.setStyleSheet("font-size: 18px; font-weight: bold; margin-bottom: 10px;")
+        metrics_layout.addWidget(metrics_label)
+
+        metrics_grid = QGridLayout()
+        metrics_grid.setColumnStretch(0, 1)
+        metrics_grid.setColumnStretch(1, 1)
+        metrics_grid.setSpacing(10)
+
+        self.loss_label = QLabel("Loss: N/A")
+        self.accuracy_label = QLabel("Accuracy: N/A")
+        self.val_loss_label = QLabel("Val Loss: N/A")
+        self.val_accuracy_label = QLabel("Val Accuracy: N/A")
+
+        metrics_grid.addWidget(self.loss_label, 0, 0)
+        metrics_grid.addWidget(self.accuracy_label, 0, 1)
+        metrics_grid.addWidget(self.val_loss_label, 1, 0)
+        metrics_grid.addWidget(self.val_accuracy_label, 1, 1)
+
+        metrics_layout.addLayout(metrics_grid)
+
+        right_layout.addWidget(metrics_frame)
+
+        # Add right panel to main layout
+        main_layout.addWidget(right_panel, 1)
+
+        return training_widget
+
+    def create_drawing_page(self):
+        drawing_widget = QWidget()
+        main_layout = QHBoxLayout(drawing_widget)
+        main_layout.setContentsMargins(20, 20, 20, 20)
+        main_layout.setSpacing(20)
+
+        # Left side - Drawing area
+        left_container = QWidget()
+        left_layout = QVBoxLayout(left_container)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(10)
+
+        drawing_container = QWidget()
+        drawing_container.setFixedSize(600, 600)
+        drawing_container.setStyleSheet("background-color: #2A2A2A; border-radius: 10px;")
+        drawing_layout = QVBoxLayout(drawing_container)
+        drawing_layout.setContentsMargins(10, 10, 10, 10)
+        drawing_layout.setAlignment(Qt.AlignCenter)
+
+        self.drawing_area = DrawingArea()
+        drawing_layout.addWidget(self.drawing_area)
+
+        left_layout.addWidget(drawing_container)
+
+        clear_button = QPushButton("Clear")
+        clear_button.clicked.connect(self.drawing_area.clear)
+        clear_button.setStyleSheet("""
+            QPushButton {
+                background-color: #3A3A3A;
+                color: white;
+                border: none;
+                padding: 10px 20px;
+                font-size: 16px;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #4A4A4A;
+            }
+        """)
+        left_layout.addWidget(clear_button, alignment=Qt.AlignCenter)
+
+        main_layout.addWidget(left_container)
+
+        # Right side - Prediction area
+        prediction_container = QWidget()
+        prediction_container.setStyleSheet("background-color: #2A2A2A; border-radius: 10px;")
+        prediction_layout = QVBoxLayout(prediction_container)
+        prediction_layout.setContentsMargins(20, 20, 20, 20)
+        prediction_layout.setSpacing(15)
+
+        prediction_title = QLabel("Prediction")
+        prediction_title.setStyleSheet("font-size: 24px; font-weight: bold; color: white;")
+        prediction_layout.addWidget(prediction_title, alignment=Qt.AlignCenter)
+
+        self.prediction_label = QLabel("?")
+        self.prediction_label.setStyleSheet("""
+            font-size: 120px;
+            font-weight: bold;
+            color: #4A90E2;
+            background-color: #1E1E1E;
+            border-radius: 20px;
+            padding: 20px;
+        """)
+        self.prediction_label.setAlignment(Qt.AlignCenter)
+        prediction_layout.addWidget(self.prediction_label)
+
+        confidence_frame = QFrame()
+        confidence_frame.setStyleSheet("background-color: #1E1E1E; border-radius: 10px; padding: 10px;")
+        confidence_layout = QVBoxLayout(confidence_frame)
+
+        confidence_title = QLabel("Top 3 Predictions")
+        confidence_title.setStyleSheet("font-size: 18px; font-weight: bold; color: white;")
+        confidence_layout.addWidget(confidence_title)
+
+        self.confidence_labels = []
+        for i in range(3):
+            label = QLabel()
+            label.setStyleSheet("font-size: 16px; color: #BBBBBB;")
+            confidence_layout.addWidget(label)
+            self.confidence_labels.append(label)
+
+        prediction_layout.addWidget(confidence_frame)
+
+        predict_button = QPushButton("Predict")
+        predict_button.clicked.connect(self.predict_digit)
+        predict_button.setStyleSheet("""
+            QPushButton {
+                background-color: #4A90E2;
+                color: white;
+                border: none;
+                padding: 15px 30px;
+                font-size: 18px;
+                font-weight: bold;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #3A80D2;
+            }
+        """)
+        prediction_layout.addWidget(predict_button)
+
+        back_button = QPushButton("Back to Main Menu")
+        back_button.clicked.connect(lambda: self.stacked_widget.setCurrentIndex(0))
+        back_button.setStyleSheet("""
+            QPushButton {
+                background-color: #3A3A3A;
+                color: white;
+                border: none;
+                padding: 10px 20px;
+                font-size: 16px;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #4A4A4A;
+            }
+        """)
+        prediction_layout.addWidget(back_button)
+
+        main_layout.addWidget(prediction_container)
+
+        return drawing_widget
+
+    def start_training(self):
+        self.stacked_widget.setCurrentIndex(1)
+
+    def start_testing(self):
+        if self.model is None:
+            self.model = self.load_saved_model()
+        if self.model:
+            self.stacked_widget.setCurrentIndex(2)
+        else:
+            self.training_status.setText("No saved model found. Please train the model first.")
+            self.stacked_widget.setCurrentIndex(1)
+
+    def train_model(self):
+        try:
+            self.epochs = int(self.epochs_input.text())
+            batch_size = int(self.batch_size_input.text())
+            learning_rate = float(self.learning_rate_input.text())
+        except ValueError:
+            self.training_status.setText("Invalid input. Please check your settings.")
+            return
+
+        self.training_status.setText("Loading and preprocessing data...")
+        QApplication.processEvents()
+    
+        (x_train, y_train), (x_test, y_test) = self.load_and_preprocess_data()
+        self.model = self.create_model()
+    
+        optimizer = self.optimizer_input.currentText()
+    
+        if optimizer == 'adam':
+            opt = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+        elif optimizer == 'sgd':
+            opt = tf.keras.optimizers.SGD(learning_rate=learning_rate)
+        else:
+            opt = tf.keras.optimizers.RMSprop(learning_rate=learning_rate)
+    
+        self.model.compile(optimizer=opt, loss='categorical_crossentropy', metrics=['accuracy'])
+    
+        self.training_status.setText("Training model...")
+        QApplication.processEvents()
+    
+        use_data_augmentation = self.data_augmentation_checkbox.isChecked()
+        use_lr_schedule = self.lr_schedule_checkbox.isChecked()
+        use_early_stopping = self.early_stopping_checkbox.isChecked()
+    
+        self.training_thread = TrainingThread(
+        self.model, x_train, y_train, x_test, y_test, self.epochs, batch_size,
+        use_data_augmentation=use_data_augmentation,
+        use_lr_schedule=use_lr_schedule,
+        use_early_stopping=use_early_stopping
+        )
+        self.training_thread.update_progress.connect(self.update_training_progress)
+        self.training_thread.training_finished.connect(self.training_finished)
+        self.training_thread.start()
+
+        
+    def update_training_progress(self, progress, logs):
+        self.progress_bar.setValue(progress)
+        self.training_status.setText(f"Epoch {progress}/{self.epochs} completed")
+        self.loss_label.setText(f"Loss: {logs['loss']:.4f}")
+        self.accuracy_label.setText(f"Accuracy: {logs['accuracy']:.4f}")
+        self.val_loss_label.setText(f"Val Loss: {logs['val_loss']:.4f}")
+        self.val_accuracy_label.setText(f"Val Accuracy: {logs['val_accuracy']:.4f}")
+
+    def training_finished(self, trained_model, test_loss, test_acc):
+        self.model = trained_model
+        self.training_status.setText(f"Training completed. Test accuracy: {test_acc:.4f}")
+        self.save_model_dialog()
+
+    def save_model_dialog(self):
+        reply = QMessageBox.question(self, 'Save Model', 'Do you want to save the trained model?',
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if reply == QMessageBox.Yes:
+            file_dialog = QFileDialog()
+            file_path, _ = file_dialog.getSaveFileName(self, "Save Model", "", "H5 Files (*.h5)")
+            if file_path:
+                self.save_model(self.model, filename=file_path)
+            else:
+                self.save_model(self.model)  # Save to default location
+
+    def predict_digit(self):
+        if self.model is None:
+            self.model = self.load_saved_model()
+        if self.model:
+            img = self.drawing_area.get_image()
+            img = img.reshape(1, 28, 28, 1)
+            predictions = self.model.predict(img)[0]
+            digit = np.argmax(predictions)
+            confidence = predictions[digit] * 100
+            
+            self.prediction_label.setText(f"{digit}")
+            
+            # Display top 3 predictions
+            top_3 = np.argsort(predictions)[-3:][::-1]
+            for i, idx in enumerate(top_3):
+                self.confidence_labels[i].setText(f"Digit {idx}: {predictions[idx]*100:.2f}%")
+        else:
+            self.prediction_label.setText("No model")
+
+    @staticmethod
+    def create_model(conv1_filters=32, conv2_filters=64, dense_units=256, dropout_rate=0.5):
+        model = Sequential([
+            Conv2D(conv1_filters, (3, 3), activation='relu', input_shape=(28, 28, 1)),
+            BatchNormalization(),
+            Conv2D(conv1_filters, (3, 3), activation='relu'),
+            MaxPooling2D((2, 2)),
+            BatchNormalization(),
+            Conv2D(conv2_filters, (3, 3), activation='relu'),
+            BatchNormalization(),
+            Conv2D(conv2_filters, (3, 3), activation='relu'),
+            MaxPooling2D((2, 2)),
+            BatchNormalization(),
+            Flatten(),
+            Dense(dense_units, activation='relu'),
+            BatchNormalization(),
+            Dropout(dropout_rate),
+            Dense(10, activation='softmax')
+        ])
+        return model
+    
+    @staticmethod
+    def save_model(model, filename='mnist_cnn_model.h5'):
+        model.save(filename)
+        print(f"Model saved as {filename}")
+    
+    @staticmethod
+    def load_saved_model(filename='mnist_cnn_model.h5'):
+        if os.path.exists(filename):
+            model = load_model(filename)
+            print(f"Model loaded from {filename}")
+            return model
+        else:
+            print(f"No saved model found at {filename}")
+            return None
+
+class DrawingArea(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(560, 560)
+        self.pixmap = QPixmap(560, 560)
+        self.pixmap.fill(Qt.black)
+        self.last_point = QPoint()
+        self.pen_color = Qt.white
+        self.pen_width = 30
+        self.is_drawing = False
+
+        # Add grid
+        self.grid_color = QColor(64, 64, 64)  # Dark gray
+        self.grid_pen = QPen(self.grid_color, 1, Qt.SolidLine)
+        self.draw_grid()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.drawPixmap(self.rect(), self.pixmap)
+
+    def mousePressEvent(self, event):
+        self.is_drawing = True
+        self.last_point = event.pos()
+
+    def mouseMoveEvent(self, event):
+        if self.is_drawing:
+            painter = QPainter(self.pixmap)
+            painter.setPen(QPen(self.pen_color, self.pen_width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            painter.drawLine(self.last_point, event.pos())
+            self.last_point = event.pos()
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        self.is_drawing = False
+
+    def clear(self):
+        self.pixmap.fill(Qt.black)
+        self.draw_grid()
+        self.update()
+
+    def draw_grid(self):
+        painter = QPainter(self.pixmap)
+        painter.setPen(self.grid_pen)
+        
+        # Draw 4x4 grid
+        cell_size = self.width() // 4
+        for i in range(1, 4):
+            # Vertical lines
+            painter.drawLine(i * cell_size, 0, i * cell_size, self.height())
+            # Horizontal lines
+            painter.drawLine(0, i * cell_size, self.width(), i * cell_size)
+
+    def get_image(self):
+        img = self.pixmap.toImage()
+        img = img.convertToFormat(QImage.Format_Grayscale8)
+        ptr = img.bits()
+        ptr.setsize(img.byteCount())
+        arr = np.frombuffer(ptr, np.uint8).reshape((560, 560))
+        arr = cv2.resize(arr, (28, 28))
+        arr = arr.astype(np.float32) / 255.0
+        return arr
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = MNISTClassifier()
+    window.show()
+    sys.exit(app.exec_())
